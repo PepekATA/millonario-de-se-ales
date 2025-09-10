@@ -13,12 +13,17 @@ from datetime import datetime, timedelta
 import math
 import concurrent.futures
 from typing import Dict, List, Optional
+import logging
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objs as go
 from plotly.subplots import make_subplots
+
+# Configurar logging
+logging.basicConfig(filename='app_errors.log', level=logging.ERROR, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Alpaca client imports (compatibility)
 try:
@@ -51,6 +56,8 @@ st.set_page_config(
 # -----------------------
 def save_credentials(key: str, secret: str, base_url: str = "https://paper-api.alpaca.markets"):
     """Guarda credenciales de forma permanente"""
+    # Sanitizar base_url
+    base_url = base_url.strip()
     data = {
         "ALPACA_API_KEY": key,
         "ALPACA_API_SECRET": secret,
@@ -63,6 +70,7 @@ def save_credentials(key: str, secret: str, base_url: str = "https://paper-api.a
         return True
     except Exception as e:
         st.error(f"Error guardando credenciales: {e}")
+        logging.error(f"Error saving credentials: {e}")
         return False
 
 def load_credentials():
@@ -71,7 +79,8 @@ def load_credentials():
         try:
             with open(CRED_FILE, "r") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            logging.error(f"Error loading credentials: {e}")
             return None
     return None
 
@@ -123,7 +132,7 @@ def create_alpaca_client(creds):
     try:
         api_key = creds["ALPACA_API_KEY"]
         api_secret = creds["ALPACA_API_SECRET"]
-        base_url = creds.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        base_url = creds.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()  # Sanitizado
         
         if ALPACA_LIB == "tradeapi":
             return tradeapi.REST(api_key, api_secret, base_url, api_version='v2')
@@ -134,6 +143,7 @@ def create_alpaca_client(creds):
             return None
     except Exception as e:
         st.error(f"❌ Error conectando con Alpaca: {e}")
+        logging.error(f"Alpaca client error: {e}")
         return None
 
 # -----------------------
@@ -233,6 +243,7 @@ def advanced_prediction_system(close_series, volume_series=None):
         }
         
     except Exception as e:
+        logging.error(f"Prediction error: {e}")
         return create_empty_prediction()
 
 def calculate_trend_score(ema_8, ema_21, ema_50, rsi_val, bb_position, macd_signal):
@@ -353,13 +364,13 @@ def create_empty_prediction():
 # OBTENER ACTIVOS 24/7
 # -----------------------
 @st.cache_data(ttl=3600)  # Cache por 1 hora
-def get_24_7_assets(client):
+def get_24_7_assets(_client):  # 👈 USO DE _client PARA EVITAR HASHING
     """Obtiene solo activos que operan 24/7 (Forex + Crypto)"""
     assets_24_7 = []
     
     try:
         if ALPACA_LIB == "tradeapi":
-            all_assets = client.list_assets()
+            all_assets = _client.list_assets()
             for asset in all_assets:
                 asset_class = getattr(asset, 'asset_class', '') or getattr(asset, 'class', '')
                 status = getattr(asset, 'status', '')
@@ -393,6 +404,7 @@ def get_24_7_assets(client):
             
     except Exception as e:
         st.warning(f"Error obteniendo activos: {e}")
+        logging.error(f"Error fetching assets: {e}")
         # Return fallback
         return [
             {'symbol': 'EURUSD', 'class': 'fx', 'name': 'Euro/US Dollar'},
@@ -403,13 +415,14 @@ def get_24_7_assets(client):
     return assets_24_7
 
 # -----------------------
-# OBTENER DATOS DE PRECIOS
+# OBTENER DATOS DE PRECIOS (CON CACHÉ)
 # -----------------------
-def fetch_price_data(client, symbol, timeframe="1Min", limit=500):
-    """Obtiene datos de precios con manejo robusto de errores"""
+@st.cache_data(ttl=300)  # Cache por 5 minutos
+def fetch_price_data_cached(_client, symbol, timeframe="1Min", limit=500):
+    """Obtiene datos de precios con manejo robusto de errores (caché)"""
     try:
         if ALPACA_LIB == "tradeapi":
-            bars = client.get_bars(symbol, timeframe, limit=limit).df
+            bars = _client.get_bars(symbol, timeframe, limit=limit).df
             
             # Manejar MultiIndex
             if isinstance(bars.columns, pd.MultiIndex):
@@ -429,9 +442,14 @@ def fetch_price_data(client, symbol, timeframe="1Min", limit=500):
             return bars
             
     except Exception as e:
+        logging.error(f"Error fetching price data for {symbol}: {e}")
         return None
     
     return None
+
+def fetch_price_data(client, symbol, timeframe="1Min", limit=500):
+    """Wrapper sin caché (para uso interno si se necesita fresco)"""
+    return fetch_price_data_cached(client, symbol, timeframe, limit)
 
 # -----------------------
 # PROCESAMIENTO DE PREDICCIONES
@@ -442,11 +460,11 @@ def process_asset_prediction(client, asset_info):
     
     try:
         # Obtener datos de precios
-        price_data = fetch_price_data(client, symbol, "1Min", 200)
+        price_data = fetch_price_data_cached(client, symbol, "1Min", 200)
         
         if price_data is None or price_data.empty:
             # Intentar con timeframe más largo
-            price_data = fetch_price_data(client, symbol, "5Min", 200)
+            price_data = fetch_price_data_cached(client, symbol, "5Min", 200)
         
         if price_data is None or price_data.empty:
             return create_error_result(symbol, "Sin datos")
@@ -466,6 +484,7 @@ def process_asset_prediction(client, asset_info):
         }
         
     except Exception as e:
+        logging.error(f"Error processing {symbol}: {e}")
         return create_error_result(symbol, str(e))
 
 def create_error_result(symbol, error_msg):
@@ -480,6 +499,42 @@ def create_error_result(symbol, error_msg):
         'error': error_msg,
         'last_update': datetime.now()
     }
+
+# -----------------------
+# FUNCIONES AUXILIARES
+# -----------------------
+def format_duration(minutes):
+    """Formatea duración en formato legible"""
+    if minutes < 1:
+        return f"{int(minutes * 60)}s"
+    elif minutes < 60:
+        return f"{int(minutes)}m"
+    elif minutes < 1440:
+        hours = int(minutes / 60)
+        return f"{hours}h"
+    else:
+        days = int(minutes / 1440)
+        return f"{days}d"
+
+def get_market_status():
+    """Obtiene estado actual del mercado"""
+    now = datetime.now()
+    if now.weekday() < 5:  # Lunes a Viernes
+        return "🟢 Mercado Abierto (Alta Liquidez)"
+    else:  # Fin de semana
+        return "🟡 Fin de Semana (Liquidez Reducida)"
+
+def calculate_risk_score(prediction):
+    """Calcula score de riesgo basado en predicción"""
+    volatility = prediction.get('volatility', 0)
+    confidence = prediction.get('confidence', 50)
+    risk = (volatility * 100) + ((100 - confidence) * 0.5)
+    if risk < 20:
+        return "🟢 Bajo"
+    elif risk < 50:
+        return "🟡 Medio"
+    else:
+        return "🔴 Alto"
 
 # -----------------------
 # APLICACIÓN PRINCIPAL
@@ -501,7 +556,8 @@ def main():
     # Header principal
     st.title("🔮 QuickTrend 24/7 - Predictor en Tiempo Real")
     st.markdown("**Predicciones automáticas para activos 24/7 (Forex & Crypto)**")
-    
+    st.caption(f"Última actualización: {datetime.now().strftime('%H:%M:%S')}")
+
     # Sidebar de configuración
     with st.sidebar:
         st.header("⚙️ Configuración")
@@ -513,6 +569,16 @@ def main():
         show_confidence = st.checkbox("Mostrar confianza", value=True)
         show_detailed_timeframes = st.checkbox("Mostrar todos los timeframes", value=True)
         
+        # Dark mode toggle
+        if st.checkbox("🌙 Modo Oscuro", value=False):
+            st.markdown("""
+            <style>
+                .stApp { background-color: #1E1E1E; color: white; }
+                .stMarkdown, .stText, .stMetric { color: white; }
+                .stButton>button { background-color: #007BFF; color: white; }
+            </style>
+            """, unsafe_allow_html=True)
+        
         st.markdown("---")
         if st.button("🗑️ Reconfigurar API"):
             if os.path.exists(CRED_FILE):
@@ -521,33 +587,34 @@ def main():
     
     # Obtener activos 24/7
     with st.spinner("📡 Obteniendo activos 24/7..."):
-        assets_24_7 = get_24_7_assets(client)
+        assets_24_7 = get_24_7_assets(client)  # 👈 PASAMOS client normal, la función usa _client
         assets_24_7 = assets_24_7[:max_assets]  # Limitar cantidad
     
     st.success(f"✅ {len(assets_24_7)} activos 24/7 encontrados")
     
-    # Contenedor principal para resultados
-    results_container = st.container()
-    
+    # Skeleton loading mientras se procesan predicciones
+    if not auto_refresh:
+        st.info("⏳ Generando predicciones...")
+
     # Procesar predicciones
     with st.spinner("🔮 Generando predicciones..."):
         progress_bar = st.progress(0)
         results = []
         
-        # Procesamiento secuencial para evitar rate limits
         for i, asset in enumerate(assets_24_7):
             result = process_asset_prediction(client, asset)
             results.append(result)
             progress_bar.progress((i + 1) / len(assets_24_7))
-            
-            # Pequeño delay para evitar rate limiting
-            time.sleep(0.1)
+            time.sleep(0.1)  # evitar rate limits
     
     # Mostrar resultados
     display_predictions(results, show_confidence, show_detailed_timeframes)
     
     # Gráfico detallado
     display_detailed_chart(client, results)
+    
+    # Estadísticas
+    display_performance_stats(results)
     
     # Auto-refresh
     if auto_refresh:
@@ -557,19 +624,16 @@ def main():
 def display_predictions(results, show_confidence, show_detailed_timeframes):
     """Muestra las predicciones en formato visual"""
     
-    # Filtrar solo resultados con datos
     valid_results = [r for r in results if r['has_data']]
     
     if not valid_results:
         st.warning("⚠️ No se pudieron obtener predicciones")
         return
     
-    # Ordenar por confianza/fuerza
     valid_results.sort(key=lambda x: x['prediction']['confidence'], reverse=True)
     
     st.markdown("## 📊 Predicciones en Tiempo Real")
     
-    # Vista en tarjetas
     cols = st.columns(3)
     
     for i, result in enumerate(valid_results):
@@ -584,21 +648,19 @@ def display_prediction_card(result, show_confidence, show_detailed_timeframes):
     prediction = result['prediction']
     direction = prediction['direction']
     
-    # Color según dirección
     if direction == "SUBIENDO":
-        color = "#00C851"  # Verde
+        color = "#00C851"
         emoji = "📈"
         bg_color = "#E8F5E8"
     elif direction == "BAJANDO":
-        color = "#FF4444"  # Rojo
+        color = "#FF4444"
         emoji = "📉"
         bg_color = "#FFF0F0"
     else:
-        color = "#6C757D"  # Gris
+        color = "#6C757D"
         emoji = "➖"
         bg_color = "#F8F9FA"
     
-    # Crear tarjeta
     with st.container():
         st.markdown(f"""
         <div style="
@@ -617,7 +679,6 @@ def display_prediction_card(result, show_confidence, show_detailed_timeframes):
         </div>
         """, unsafe_allow_html=True)
         
-        # Información principal
         col1, col2 = st.columns(2)
         
         with col1:
@@ -630,34 +691,33 @@ def display_prediction_card(result, show_confidence, show_detailed_timeframes):
             if show_confidence:
                 st.metric(
                     "Confianza",
-                    f"{prediction['confidence']:.1f}%"
+                    f"{prediction['confidence']:.1f}%",
+                    help="Basado en consistencia de indicadores y volatilidad"
                 )
         
         with col2:
             st.metric(
                 "RSI",
                 f"{prediction['rsi']:.1f}",
-                f"Volatilidad: {prediction['volatility']:.2f}%"
+                f"Vol: {prediction['volatility']:.2f}%",
+                help=">70 sobrecomprado, <30 sobrevendido"
             )
             
             st.metric(
-                "Precio Actual",
+                "Precio",
                 f"{prediction['current_price']:.5f}" if prediction['current_price'] else "N/D"
             )
         
-        # Predicciones por timeframe
         if show_detailed_timeframes and prediction['timeframe_predictions']:
-            st.markdown("**Predicciones por Tiempo:**")
-            
+            st.markdown("**⏱️ Predicciones por Tiempo:**")
             tf_data = []
             for tf, pred in prediction['timeframe_predictions'].items():
                 tf_data.append({
                     'Tiempo': tf,
                     'Dirección': pred['direction'],
                     'Probabilidad': f"{pred['probability']:.1f}%",
-                    'Duración': f"{pred['duration_minutes']:.1f}m"
+                    'Duración': format_duration(pred['duration_minutes'])
                 })
-            
             if tf_data:
                 df_tf = pd.DataFrame(tf_data)
                 st.dataframe(df_tf, use_container_width=True, hide_index=True)
@@ -671,32 +731,27 @@ def display_detailed_chart(client, results):
     
     st.markdown("## 📈 Análisis Técnico Detallado")
     
-    # Selector de activo
     symbols = [r['symbol'] for r in valid_results]
     selected_symbol = st.selectbox("Selecciona activo para análisis:", symbols)
     
     if not selected_symbol:
         return
     
-    # Encontrar resultado seleccionado
     selected_result = next((r for r in valid_results if r['symbol'] == selected_symbol), None)
     if not selected_result:
         return
     
-    # Obtener datos históricos para gráfico
     with st.spinner(f"📊 Cargando datos de {selected_symbol}..."):
-        price_data = fetch_price_data(client, selected_symbol, "5Min", 300)
+        price_data = fetch_price_data_cached(client, selected_symbol, "5Min", 300)
         
         if price_data is None or price_data.empty:
             st.warning("No se pudieron cargar datos para el gráfico")
             return
         
-        # Calcular indicadores para el gráfico
         price_data['EMA8'] = ema(price_data['close'], 8)
         price_data['EMA21'] = ema(price_data['close'], 21)
         price_data['RSI'] = rsi(price_data['close'])
         
-        # Crear gráfico
         create_technical_chart(price_data, selected_result)
 
 def create_technical_chart(price_data, result):
@@ -705,7 +760,6 @@ def create_technical_chart(price_data, result):
     symbol = result['symbol']
     prediction = result['prediction']
     
-    # Crear subplots
     fig = make_subplots(
         rows=2, cols=1,
         subplot_titles=(f'{symbol} - Precio y EMAs', 'RSI'),
@@ -713,57 +767,23 @@ def create_technical_chart(price_data, result):
         row_weights=[0.7, 0.3]
     )
     
-    # Gráfico principal - Candlesticks
-    fig.add_trace(
-        go.Candlestick(
-            x=price_data.index,
-            open=price_data['open'],
-            high=price_data['high'],
-            low=price_data['low'],
-            close=price_data['close'],
-            name=symbol
-        ),
-        row=1, col=1
-    )
+    fig.add_trace(go.Candlestick(
+        x=price_data.index,
+        open=price_data['open'],
+        high=price_data['high'],
+        low=price_data['low'],
+        close=price_data['close'],
+        name=symbol
+    ), row=1, col=1)
     
-    # EMAs
-    fig.add_trace(
-        go.Scatter(
-            x=price_data.index,
-            y=price_data['EMA8'],
-            name='EMA 8',
-            line=dict(color='orange', width=2)
-        ),
-        row=1, col=1
-    )
+    fig.add_trace(go.Scatter(x=price_data.index, y=price_data['EMA8'], name='EMA 8', line=dict(color='orange')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=price_data.index, y=price_data['EMA21'], name='EMA 21', line=dict(color='blue')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=price_data.index, y=price_data['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
     
-    fig.add_trace(
-        go.Scatter(
-            x=price_data.index,
-            y=price_data['EMA21'],
-            name='EMA 21',
-            line=dict(color='blue', width=2)
-        ),
-        row=1, col=1
-    )
-    
-    # RSI
-    fig.add_trace(
-        go.Scatter(
-            x=price_data.index,
-            y=price_data['RSI'],
-            name='RSI',
-            line=dict(color='purple', width=2)
-        ),
-        row=2, col=1
-    )
-    
-    # Líneas de referencia RSI
     fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
     fig.add_hline(y=50, line_dash="dot", line_color="gray", row=2, col=1)
     
-    # Color de fondo según predicción
     if prediction['direction'] == "SUBIENDO":
         bg_color = "rgba(0, 200, 81, 0.1)"
     elif prediction['direction'] == "BAJANDO":
@@ -771,408 +791,93 @@ def create_technical_chart(price_data, result):
     else:
         bg_color = "rgba(108, 117, 125, 0.1)"
     
-    # Configurar layout
     fig.update_layout(
         height=700,
         title=f"📈 {symbol} - Análisis Técnico en Tiempo Real",
         xaxis_title="Tiempo",
         plot_bgcolor=bg_color,
         showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        )
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     
-    # Configurar ejes Y
     fig.update_yaxes(title_text="Precio", row=1, col=1)
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # Información adicional del análisis
     col1, col2, col3 = st.columns(3)
-    
     with col1:
         st.markdown("### 📊 Resumen Técnico")
         st.write(f"**Dirección:** {prediction['direction']}")
         st.write(f"**Fuerza:** {prediction['strength']:.1f}%")
         st.write(f"**Confianza:** {prediction['confidence']:.1f}%")
-    
     with col2:
         st.markdown("### 🎯 Indicadores Clave")
         st.write(f"**RSI:** {prediction['rsi']:.1f}")
         st.write(f"**Volatilidad:** {prediction['volatility']:.2f}%")
         st.write(f"**Cambio 1m:** {prediction['price_change_1m']:.3f}%")
-    
     with col3:
         st.markdown("### ⏱️ Predicciones Rápidas")
         if prediction['timeframe_predictions']:
-            # Mostrar predicciones de corto plazo
             short_term = ['30s', '1m', '2m', '5m']
             for tf in short_term:
                 if tf in prediction['timeframe_predictions']:
                     pred = prediction['timeframe_predictions'][tf]
-                    direction_emoji = "📈" if pred['direction'] == "SUBIENDO" else "📉"
-                    st.write(f"**{tf}:** {direction_emoji} {pred['probability']:.1f}% ({pred['duration_minutes']:.1f}m)")
+                    emoji = "📈" if pred['direction'] == "SUBIENDO" else "📉"
+                    st.write(f"**{tf}:** {emoji} {pred['probability']:.1f}% ({format_duration(pred['duration_minutes'])})")
 
-# -----------------------
-# SISTEMA DE MONITOREO EN TIEMPO REAL
-# -----------------------
-def create_live_monitoring_dashboard(client, assets):
-    """Crea dashboard de monitoreo en tiempo real"""
-    
-    st.markdown("## 🔴 LIVE - Monitor de Señales")
-    
-    # Contenedor para métricas en tiempo real
-    metrics_container = st.container()
-    
-    # Contenedor para alertas
-    alerts_container = st.container()
-    
-    # Obtener datos en tiempo real
-    live_data = {}
-    strong_signals = []
-    
-    for asset in assets[:10]:  # Limitar a 10 para rendimiento
-        try:
-            result = process_asset_prediction(client, asset)
-            if result['has_data']:
-                live_data[asset['symbol']] = result
-                
-                # Detectar señales fuertes
-                prediction = result['prediction']
-                if prediction['confidence'] > 80 and prediction['strength'] > 70:
-                    strong_signals.append({
-                        'symbol': asset['symbol'],
-                        'direction': prediction['direction'],
-                        'confidence': prediction['confidence'],
-                        'strength': prediction['strength']
-                    })
-        except:
-            continue
-    
-    # Mostrar métricas en tiempo real
-    with metrics_container:
-        if live_data:
-            st.markdown("### ⚡ Métricas en Tiempo Real")
-            
-            cols = st.columns(4)
-            
-            # Total activos monitoreados
-            with cols[0]:
-                st.metric(
-                    "🎯 Activos Activos",
-                    len(live_data),
-                    f"de {len(assets)} totales"
-                )
-            
-            # Señales alcistas
-            bullish_count = sum(1 for data in live_data.values() 
-                              if data['prediction']['direction'] == "SUBIENDO")
-            with cols[1]:
-                st.metric(
-                    "📈 Señales Alcistas",
-                    bullish_count,
-                    f"{(bullish_count/len(live_data)*100):.1f}%" if live_data else "0%"
-                )
-            
-            # Señales bajistas
-            bearish_count = len(live_data) - bullish_count
-            with cols[2]:
-                st.metric(
-                    "📉 Señales Bajistas",
-                    bearish_count,
-                    f"{(bearish_count/len(live_data)*100):.1f}%" if live_data else "0%"
-                )
-            
-            # Confianza promedio
-            avg_confidence = sum(data['prediction']['confidence'] 
-                               for data in live_data.values()) / len(live_data) if live_data else 0
-            with cols[3]:
-                st.metric(
-                    "🎲 Confianza Promedio",
-                    f"{avg_confidence:.1f}%",
-                    "Alta" if avg_confidence > 70 else ("Media" if avg_confidence > 50 else "Baja")
-                )
-    
-    # Mostrar alertas de señales fuertes
-    with alerts_container:
-        if strong_signals:
-            st.markdown("### 🚨 Alertas de Señales Fuertes")
-            
-            for signal in strong_signals[:5]:  # Máximo 5 alertas
-                direction_color = "#00C851" if signal['direction'] == "SUBIENDO" else "#FF4444"
-                direction_emoji = "📈" if signal['direction'] == "SUBIENDO" else "📉"
-                
-                st.markdown(f"""
-                <div style="
-                    background: linear-gradient(90deg, {direction_color}15, transparent);
-                    border-left: 4px solid {direction_color};
-                    padding: 10px;
-                    margin: 10px 0;
-                    border-radius: 5px;
-                ">
-                    <strong>{direction_emoji} {signal['symbol']}</strong> - {signal['direction']} 
-                    | Confianza: <strong>{signal['confidence']:.1f}%</strong> 
-                    | Fuerza: <strong>{signal['strength']:.1f}%</strong>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.info("🔍 No hay señales fuertes en este momento")
-
-# -----------------------
-# SISTEMA DE ALERTAS Y NOTIFICACIONES
-# -----------------------
-def setup_alert_system():
-    """Configura sistema de alertas personalizables"""
-    
-    with st.sidebar.expander("🔔 Configurar Alertas"):
-        st.markdown("**Alertas Automáticas**")
-        
-        alert_confidence_threshold = st.slider(
-            "Umbral de confianza (%)",
-            50, 95, 80
-        )
-        
-        alert_strength_threshold = st.slider(
-            "Umbral de fuerza (%)",
-            50, 100, 70
-        )
-        
-        alert_symbols = st.multiselect(
-            "Símbolos a monitorear",
-            ["EURUSD", "GBPUSD", "BTCUSD", "ETHUSD"],
-            default=["EURUSD", "BTCUSD"]
-        )
-        
-        enable_sound_alerts = st.checkbox("🔊 Alertas sonoras", value=False)
-        
-        return {
-            'confidence_threshold': alert_confidence_threshold,
-            'strength_threshold': alert_strength_threshold,
-            'symbols': alert_symbols,
-            'sound_enabled': enable_sound_alerts
-        }
-
-# -----------------------
-# EXPORTACIÓN DE DATOS
-# -----------------------
-def export_predictions_data(results):
-    """Permite exportar datos de predicciones"""
-    
-    if not results:
-        return
-    
-    with st.sidebar.expander("💾 Exportar Datos"):
-        st.markdown("**Descargar Predicciones**")
-        
-        # Preparar datos para exportación
-        export_data = []
-        for result in results:
-            if result['has_data']:
-                pred = result['prediction']
-                
-                # Datos básicos
-                row = {
-                    'Símbolo': result['symbol'],
-                    'Nombre': result['name'],
-                    'Clase': result['class'],
-                    'Dirección': pred['direction'],
-                    'Confianza_%': pred['confidence'],
-                    'Fuerza_%': pred['strength'],
-                    'RSI': pred['rsi'],
-                    'Volatilidad_%': pred['volatility'],
-                    'Precio_Actual': pred['current_price'],
-                    'Timestamp': result['last_update'].strftime('%Y-%m-%d %H:%M:%S')
-                }
-                
-                # Agregar predicciones por timeframe
-                for tf, tf_pred in pred.get('timeframe_predictions', {}).items():
-                    row[f'{tf}_Probabilidad_%'] = tf_pred['probability']
-                    row[f'{tf}_Duración_min'] = tf_pred['duration_minutes']
-                
-                export_data.append(row)
-        
-        if export_data:
-            df_export = pd.DataFrame(export_data)
-            
-            # Botón de descarga CSV
-            csv = df_export.to_csv(index=False)
-            st.download_button(
-                label="📄 Descargar CSV",
-                data=csv,
-                file_name=f"quicktrend_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
-            
-            # Botón de descarga JSON
-            json_data = df_export.to_json(orient='records', indent=2)
-            st.download_button(
-                label="📋 Descargar JSON",
-                data=json_data,
-                file_name=f"quicktrend_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
-            )
-
-# -----------------------
-# ESTADÍSTICAS Y RENDIMIENTO
-# -----------------------
 def display_performance_stats(results):
     """Muestra estadísticas de rendimiento del sistema"""
     
-    if not results:
+    valid_results = [r for r in results if r['has_data']]
+    if not valid_results:
         return
     
     st.markdown("## 📊 Estadísticas del Sistema")
-    
-    valid_results = [r for r in results if r['has_data']]
-    
-    if not valid_results:
-        st.warning("No hay datos suficientes para estadísticas")
-        return
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("### 🎯 Distribución de Señales")
-        
-        # Contar direcciones
         directions = [r['prediction']['direction'] for r in valid_results]
         direction_counts = pd.Series(directions).value_counts()
-        
-        # Crear gráfico de pie
-        fig_pie = go.Figure(data=[
-            go.Pie(
-                labels=direction_counts.index,
-                values=direction_counts.values,
-                hole=.3,
-                marker_colors=['#00C851', '#FF4444', '#6C757D']
-            )
-        ])
-        
-        fig_pie.update_layout(
-            title="Distribución de Direcciones",
-            height=300
-        )
-        
+        fig_pie = go.Figure(data=[go.Pie(labels=direction_counts.index, values=direction_counts.values, hole=.3, marker_colors=['#00C851', '#FF4444', '#6C757D'])])
+        fig_pie.update_layout(title="Direcciones", height=300)
         st.plotly_chart(fig_pie, use_container_width=True)
     
     with col2:
         st.markdown("### 📈 Distribución de Confianza")
-        
-        # Histograma de confianza
         confidences = [r['prediction']['confidence'] for r in valid_results]
-        
-        fig_hist = go.Figure(data=[
-            go.Histogram(
-                x=confidences,
-                nbinsx=10,
-                marker_color='rgba(0, 200, 81, 0.7)'
-            )
-        ])
-        
-        fig_hist.update_layout(
-            title="Distribución de Confianza",
-            xaxis_title="Confianza (%)",
-            yaxis_title="Cantidad de Activos",
-            height=300
-        )
-        
+        fig_hist = go.Figure(data=[go.Histogram(x=confidences, nbinsx=10, marker_color='rgba(0, 200, 81, 0.7)')])
+        fig_hist.update_layout(title="Confianza (%)", xaxis_title="%", yaxis_title="Activos", height=300)
         st.plotly_chart(fig_hist, use_container_width=True)
     
-    # Tabla de top performers
-    st.markdown("### 🏆 Top Performers (Mayor Confianza)")
-    
-    # Ordenar por confianza
+    st.markdown("### 🏆 Top 10 por Confianza")
     top_performers = sorted(valid_results, key=lambda x: x['prediction']['confidence'], reverse=True)[:10]
-    
-    top_data = []
-    for result in top_performers:
-        pred = result['prediction']
-        top_data.append({
-            'Símbolo': result['symbol'],
-            'Dirección': pred['direction'],
-            'Confianza (%)': f"{pred['confidence']:.1f}",
-            'Fuerza (%)': f"{pred['strength']:.1f}",
-            'RSI': f"{pred['rsi']:.1f}"
-        })
-    
-    df_top = pd.DataFrame(top_data)
-    st.dataframe(df_top, use_container_width=True, hide_index=True)
+    top_data = [{
+        'Símbolo': r['symbol'],
+        'Dirección': r['prediction']['direction'],
+        'Confianza (%)': f"{r['prediction']['confidence']:.1f}",
+        'Fuerza (%)': f"{r['prediction']['strength']:.1f}",
+        'RSI': f"{r['prediction']['rsi']:.1f}"
+    } for r in top_performers]
+    st.dataframe(pd.DataFrame(top_data), use_container_width=True, hide_index=True)
 
 # -----------------------
 # EJECUTAR APLICACIÓN
 # -----------------------
 if __name__ == "__main__":
     try:
-        # Configurar alertas
-        alert_config = setup_alert_system()
-        
-        # Ejecutar aplicación principal
         main()
-        
-        # Mostrar estadísticas al final
-        # (se ejecutaría después de obtener resultados en main)
-        
     except Exception as e:
         st.error(f"❌ Error en la aplicación: {e}")
-        
-        # Botón de reinicio en caso de error crítico
+        logging.exception("Application crashed")
         if st.button("🔄 Reiniciar Aplicación"):
             st.rerun()
-        
-        # Información de debug
         with st.expander("🔧 Información de Debug"):
             st.code(f"Error: {str(e)}")
             st.code(f"Biblioteca Alpaca: {ALPACA_LIB}")
             st.code(f"Archivo de credenciales existe: {os.path.exists(CRED_FILE)}")
-
-# -----------------------
-# FUNCIONES AUXILIARES ADICIONALES
-# -----------------------
-
-def format_duration(minutes):
-    """Formatea duración en formato legible"""
-    if minutes < 1:
-        return f"{int(minutes * 60)}s"
-    elif minutes < 60:
-        return f"{int(minutes)}m"
-    elif minutes < 1440:
-        hours = int(minutes / 60)
-        return f"{hours}h"
-    else:
-        days = int(minutes / 1440)
-        return f"{days}d"
-
-def get_market_status():
-    """Obtiene estado actual del mercado"""
-    now = datetime.now()
-    
-    # Los mercados forex y crypto operan 24/7, pero con diferentes volúmenes
-    if now.weekday() < 5:  # Lunes a Viernes
-        return "🟢 Mercado Abierto (Alta Liquidez)"
-    else:  # Fin de semana
-        return "🟡 Fin de Semana (Liquidez Reducida)"
-
-def calculate_risk_score(prediction):
-    """Calcula score de riesgo basado en predicción"""
-    volatility = prediction.get('volatility', 0)
-    confidence = prediction.get('confidence', 50)
-    
-    # Mayor volatilidad = mayor riesgo
-    # Menor confianza = mayor riesgo
-    risk = (volatility * 100) + ((100 - confidence) * 0.5)
-    
-    if risk < 20:
-        return "🟢 Bajo"
-    elif risk < 50:
-        return "🟡 Medio"
-    else:
-        return "🔴 Alto"
 
 # Footer
 st.markdown("---")
