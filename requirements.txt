@@ -1,7 +1,7 @@
-alpaca-trade-api
+streamlit
 pandas
 numpy
 matplotlib
-streamlit
+alpaca-trade-api
 scikit-learn
 tensorflow
