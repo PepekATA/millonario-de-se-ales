@@ -1,188 +1,253 @@
-# =======================================================
-# QuickTrend Trader Pro - Todo en 1
-# =======================================================
-
-import sys
-import subprocess
-
-# ---------------------------
-# Función para instalar dependencias automáticamente
-# ---------------------------
-def install_and_import(package):
-    try:
-        __import__(package)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-    finally:
-        globals()[package] = __import__(package)
-
-# Instalar librerías necesarias
-for pkg in ['alpaca_trade_api', 'pandas', 'numpy', 'matplotlib', 'streamlit', 'sklearn', 'tensorflow']:
-    install_and_import(pkg)
-
-# ---------------------------
-# Librerías importadas
-# ---------------------------
-import alpaca_trade_api as tradeapi
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import streamlit as st
+# -*- coding: utf-8 -*-
+import os
 import json
 import time
-import threading
 from datetime import datetime
+import threading
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
 from sklearn.preprocessing import MinMaxScaler
-import tensorflow as tf
+from sklearn.linear_model import LinearRegression
+import alpaca_trade_api as tradeapi
 
-# =======================================================
-# CONFIGURACIÓN
-# =======================================================
-API_KEY = "TU_API_KEY"
-API_SECRET = "TU_API_SECRET"
-BASE_URL = "https://paper-api.alpaca.markets"
-POSITIONS_FILE = "positions.json"
+# -----------------------
+# Configuración de archivos
+# -----------------------
+CRED_FILE = "alpaca_credentials.json"
+STATE_FILE = "trader_state.json"
 
-# Activos 24/7 en Alpaca Crypto
-ASSETS = ['BTC/USD', 'ETH/USD', 'DOGE/USD', 'SOL/USD', 'UNI/USD']
+# -----------------------
+# Manejo de credenciales
+# -----------------------
+def save_credentials(key, secret, base_url):
+    data = {"ALPACA_API_KEY": key.strip(),
+            "ALPACA_API_SECRET": secret.strip(),
+            "ALPACA_BASE_URL": base_url.strip()}
+    with open(CRED_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-# Inicializar API Alpaca
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+def load_credentials():
+    if os.path.exists(CRED_FILE):
+        try:
+            with open(CRED_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return None
+    return None
 
-# =======================================================
-# FUNCIONES DE PERSISTENCIA
-# =======================================================
-def load_positions():
-    try:
-        with open(POSITIONS_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
+def setup_credentials():
+    creds = load_credentials()
+    if creds and creds.get("ALPACA_API_KEY") and creds.get("ALPACA_API_SECRET"):
+        return creds
+    st.title("🤖 QuickTrend Trader Pro - Setup")
+    with st.form("form"):
+        key = st.text_input("API Key", type="password")
+        secret = st.text_input("API Secret", type="password")
+        account_type = st.radio("Tipo de cuenta", ["Demo", "Real"])
+        if st.form_submit_button("💾 Guardar y Conectar"):
+            base_url = "https://paper-api.alpaca.markets/v2" if account_type=="Demo" else "https://api.alpaca.markets"
+            save_credentials(key, secret, base_url)
+            st.experimental_rerun()
+    st.stop()
 
-def save_positions(positions):
-    with open(POSITIONS_FILE, "w") as f:
-        json.dump(positions, f, indent=2)
+# -----------------------
+# Funciones de indicadores simples
+# -----------------------
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
 
-positions = load_positions()
+def rsi(series, period=14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = np.where(ma_down>1e-9, ma_up/ma_down, 100)
+    return 100 - (100 / (1 + rs))
 
-# =======================================================
-# FUNCIONES DE IA
-# =======================================================
-def create_model():
-    model = tf.keras.Sequential([
-        tf.keras.layers.LSTM(50, return_sequences=True, input_shape=(60,1)),
-        tf.keras.layers.LSTM(50, return_sequences=False),
-        tf.keras.layers.Dense(25),
-        tf.keras.layers.Dense(1)
-    ])
-    model.compile(optimizer='adam', loss='mean_squared_error')
-    return model
+def calculate_signal(close_series):
+    if len(close_series) < 50:
+        return None
+    ema8 = ema(close_series, 8).iloc[-1]
+    ema21 = ema(close_series, 21).iloc[-1]
+    rsi_val = rsi(close_series).iloc[-1]
+    score = 0
+    if ema8 > ema21: score += 30
+    else: score -= 30
+    if rsi_val < 30: score += 25
+    elif rsi_val > 70: score -= 25
+    direction = "BUY" if score>0 else "WAIT"
+    confidence = min(95,max(5,50+abs(score)*0.4))
+    return {"direction": direction, "confidence": confidence, "rsi": rsi_val, "score": score}
 
-model = create_model()
+# -----------------------
+# Gestión de posiciones
+# -----------------------
+class TradeStateManager:
+    def __init__(self):
+        self.state = self.load_state()
+        self.lock = threading.Lock()
+    def load_state(self):
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE,"r") as f:
+                    return json.load(f)
+            except:
+                pass
+        return {"positions":{},"last_training":None}
+    def save_state(self):
+        with self.lock:
+            with open(STATE_FILE,"w") as f:
+                json.dump(self.state,f,indent=2)
+    def add_position(self,symbol,qty,entry_price):
+        with self.lock:
+            if symbol not in self.state["positions"]:
+                self.state["positions"][symbol]=[]
+            pos_id=f"{symbol}_{int(time.time())}"
+            self.state["positions"][symbol].append({
+                "id":pos_id,
+                "qty":qty,
+                "entry_price":entry_price,
+                "highest_price":entry_price,
+                "created_at":datetime.now().isoformat(),
+                "status":"open"
+            })
+            self.save_state()
+            return pos_id
+    def update_position(self,symbol,current_price):
+        with self.lock:
+            if symbol in self.state["positions"]:
+                for pos in self.state["positions"][symbol]:
+                    if pos["status"]=="open":
+                        pos["highest_price"]=max(pos["highest_price"],current_price)
+                self.save_state()
+    def get_open_positions(self,symbol=None):
+        with self.lock:
+            if symbol:
+                return [p for p in self.state["positions"].get(symbol,[]) if p["status"]=="open"]
+            else:
+                all_positions=[]
+                for sym,positions in self.state["positions"].items():
+                    all_positions.extend([p for p in positions if p["status"]=="open"])
+                return all_positions
+    def should_take_profit(self,position,current_price,take_profit_pct=0.5):
+        entry=position["entry_price"]
+        highest=position["highest_price"]
+        # Nunca vende en pérdida, solo vende en ganancia
+        if current_price>=entry*(1+take_profit_pct/100):
+            return True
+        if current_price>=entry*1.001 and current_price<highest*0.995:
+            return True
+        return False
+    def close_position(self,symbol,position_id):
+        with self.lock:
+            if symbol in self.state["positions"]:
+                for pos in self.state["positions"][symbol]:
+                    if pos["id"]==position_id and pos["status"]=="open":
+                        pos["status"]="closed"
+                        pos["closed_at"]=datetime.now().isoformat()
+                        self.save_state()
+                        return True
+            return False
+    def get_total_exposure(self,symbol):
+        with self.lock:
+            positions=self.get_open_positions(symbol)
+            return sum(p["qty"]*p["entry_price"] for p in positions)
 
-def predict_trend(prices):
-    if len(prices) < 60:
-        return 0
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(np.array(prices).reshape(-1,1))
-    X = []
-    for i in range(60, len(scaled)):
-        X.append(scaled[i-60:i,0])
-    X = np.array(X)
-    X = X.reshape((X.shape[0], X.shape[1],1))
-    pred = model.predict(X, verbose=0)
-    return pred[-1][0]
+# -----------------------
+# Clase Trader
+# -----------------------
+class AlpacaTrader:
+    def __init__(self,api_key,api_secret,base_url):
+        self.api=tradeapi.REST(api_key,api_secret,base_url,api_version='v2')
+        self.state_manager=TradeStateManager()
+        # Solo activos 24/7 (crypto)
+        self.symbols=["BTCUSD","ETHUSD","LTCUSD","BCHUSD","DOGEUSD"]
+        self.is_streaming=False
+    def get_historical_data(self,symbol,limit=100):
+        try:
+            bars=self.api.get_bars(symbol,"1Min",limit=limit).df
+            if isinstance(bars.columns,pd.MultiIndex):
+                bars=bars[symbol]
+            return bars
+        except Exception as e:
+            st.warning(f"Error obteniendo {symbol}: {e}")
+            return None
+    def execute_buy(self,symbol,current_price):
+        try:
+            account=self.api.get_account()
+            buying_power=float(account.buying_power)
+            max_risk=min(1000,buying_power*0.05)
+            qty=max(1,int(max_risk/current_price))
+            current_exposure=self.state_manager.get_total_exposure(symbol)
+            if current_exposure>buying_power*0.2:
+                return
+            self.api.submit_order(symbol=symbol,qty=qty,side='buy',type='market',time_in_force='day')
+            self.state_manager.add_position(symbol,qty,current_price)
+        except Exception as e:
+            st.warning(f"Error comprando {symbol}: {e}")
+    def execute_sell(self,symbol,position_id,qty,current_price):
+        try:
+            self.api.submit_order(symbol=symbol,qty=qty,side='sell',type='market',time_in_force='day')
+            self.state_manager.close_position(symbol,position_id)
+        except Exception as e:
+            st.warning(f"Error vendiendo {symbol}: {e}")
+    def check_positions(self,symbol,current_price):
+        open_positions=self.state_manager.get_open_positions(symbol)
+        for pos in open_positions:
+            if self.state_manager.should_take_profit(pos,current_price):
+                self.execute_sell(symbol,pos["id"],pos["qty"],current_price)
+    def start_bot(self):
+        self.running=True
+        def bot_loop():
+            while self.running:
+                for symbol in self.symbols:
+                    df=self.get_historical_data(symbol,50)
+                    if df is not None and len(df)>=50:
+                        current_price=df["close"].iloc[-1]
+                        signal=calculate_signal(df["close"])
+                        if signal and signal["direction"]=="BUY" and signal["confidence"]>70:
+                            self.execute_buy(symbol,current_price)
+                        self.check_positions(symbol,current_price)
+                time.sleep(10)
+        self.thread=threading.Thread(target=bot_loop,daemon=True)
+        self.thread.start()
+    def stop_bot(self):
+        self.running=False
+        if hasattr(self,"thread") and self.thread.is_alive():
+            self.thread.join()
 
-# =======================================================
-# FUNCIONES DE TRADING
-# =======================================================
-def get_historical(symbol, limit=200):
-    bars = api.get_crypto_bars(symbol.replace('/',''), '1Min', limit=limit).df
-    bars = bars[bars['exchange']=='CBSE']
-    return bars
+# -----------------------
+# Interfaz Streamlit
+# -----------------------
+def main():
+    creds=setup_credentials()
+    trader=AlpacaTrader(creds["ALPACA_API_KEY"],creds["ALPACA_API_SECRET"],creds["ALPACA_BASE_URL"])
 
-def get_balance():
-    try:
-        return float(api.get_account().cash)
-    except:
-        return 0
+    st.title("🤖 QuickTrend Trader Pro - Demo/Real")
+    col1,col2=st.columns(2)
+    if st.button("🚦 Iniciar Bot"):
+        trader.start_bot()
+        st.success("Bot iniciado")
+    if st.button("🛑 Detener Bot"):
+        trader.stop_bot()
+        st.warning("Bot detenido")
 
-def allocate_capital():
-    balance = get_balance()
-    allocation = balance / len(ASSETS)
-    return allocation
+    st.subheader("📊 Gráficos y Posiciones")
+    for symbol in trader.symbols:
+        df=trader.get_historical_data(symbol,50)
+        if df is not None:
+            current_price=df["close"].iloc[-1]
+            signal=calculate_signal(df["close"])
+            color='green' if signal and signal["direction"]=="BUY" else 'red'
+            st.markdown(f"### {symbol} - Precio: ${current_price:.2f}")
+            st.line_chart(df["close"],use_container_width=True)
+            open_positions=trader.state_manager.get_open_positions(symbol)
+            for pos in open_positions:
+                profit_pct=(current_price/pos["entry_price"]-1)*100
+                st.markdown(f"ID: {pos['id'][-6:]} | Qty: {pos['qty']} | Entrada: ${pos['entry_price']:.2f} | Ganancia: {profit_pct:.2f}%",unsafe_allow_html=True)
 
-def buy(symbol, qty):
-    try:
-        api.submit_order(symbol.replace('/',''), qty, 'buy', 'market', 'gtc')
-        positions[symbol] = positions.get(symbol,[])
-        positions[symbol].append({'qty':qty,'entry_time':datetime.now().isoformat(),'entry_price':get_last_price(symbol)})
-        save_positions(positions)
-    except Exception as e:
-        st.warning(f"Error comprando {symbol}: {e}")
-
-def sell(symbol, qty, index):
-    try:
-        api.submit_order(symbol.replace('/',''), qty, 'sell', 'market', 'gtc')
-        positions[symbol][index]['exit_time'] = datetime.now().isoformat()
-        positions[symbol][index]['exit_price'] = get_last_price(symbol)
-        save_positions(positions)
-    except Exception as e:
-        st.warning(f"Error vendiendo {symbol}: {e}")
-
-def get_last_price(symbol):
-    bars = get_historical(symbol, limit=1)
-    return bars['close'].iloc[-1]
-
-def monitor_positions():
-    while bot_running[0]:
-        for symbol in ASSETS:
-            if symbol in positions:
-                for i,pos in enumerate(positions[symbol]):
-                    if 'exit_price' not in pos:
-                        current = get_last_price(symbol)
-                        if current > pos['entry_price']:
-                            sell(symbol,pos['qty'],i)
-        time.sleep(5)
-
-# =======================================================
-# INTERFAZ STREAMLIT
-# =======================================================
-st.title("🤖 QuickTrend Trader Pro - 24/7 Crypto")
-st.sidebar.header("Controles del Bot")
-
-bot_running = [False]
-
-def start_bot():
-    bot_running[0] = True
-    threading.Thread(target=monitor_positions,daemon=True).start()
-    
-def stop_bot():
-    bot_running[0] = False
-
-if st.sidebar.button("Iniciar Bot"):
-    start_bot()
-if st.sidebar.button("Detener Bot"):
-    stop_bot()
-
-st.sidebar.header("Trading Manual")
-for symbol in ASSETS:
-    col1, col2 = st.sidebar.columns(2)
-    if col1.button(f"Comprar {symbol}"):
-        buy(symbol,1)
-    if col2.button(f"Vender {symbol}"):
-        if symbol in positions:
-            for i,pos in enumerate(positions[symbol]):
-                if 'exit_price' not in pos:
-                    sell(symbol,pos['qty'],i)
-                    break
-
-st.header("📊 Estado Actual")
-for symbol in ASSETS:
-    prices = get_historical(symbol)['close'][-50:].tolist()
-    trend = predict_trend(prices)
-    color = 'green' if trend>prices[-1] else 'red'
-    st.markdown(f"### {symbol} - Último: {prices[-1]:.2f} - Tendencia: {'Subiendo' if color=='green' else 'Bajando'}")
-    fig, ax = plt.subplots()
-    ax.plot(prices,color=color)
-    st.pyplot(fig)
+if __name__=="__main__":
+    main()
