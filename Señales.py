@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
-import os
-import json
-import time
+import os, json, time, threading
 from datetime import datetime
-import threading
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -13,7 +10,7 @@ from sklearn.linear_model import LinearRegression
 import alpaca_trade_api as tradeapi
 
 # -----------------------
-# Configuración de archivos
+# Archivos de configuración
 # -----------------------
 CRED_FILE = "alpaca_credentials.json"
 STATE_FILE = "trader_state.json"
@@ -22,16 +19,18 @@ STATE_FILE = "trader_state.json"
 # Manejo de credenciales
 # -----------------------
 def save_credentials(key, secret, base_url):
-    data = {"ALPACA_API_KEY": key.strip(),
-            "ALPACA_API_SECRET": secret.strip(),
-            "ALPACA_BASE_URL": base_url.strip()}
-    with open(CRED_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    data = {
+        "ALPACA_API_KEY": key.strip(),
+        "ALPACA_API_SECRET": secret.strip(),
+        "ALPACA_BASE_URL": base_url.strip()
+    }
+    with open(CRED_FILE,"w") as f:
+        json.dump(data,f,indent=2)
 
 def load_credentials():
     if os.path.exists(CRED_FILE):
         try:
-            with open(CRED_FILE, "r") as f:
+            with open(CRED_FILE,"r") as f:
                 return json.load(f)
         except:
             return None
@@ -53,7 +52,7 @@ def setup_credentials():
     st.stop()
 
 # -----------------------
-# Funciones de indicadores simples
+# Indicadores simples
 # -----------------------
 def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
@@ -61,26 +60,25 @@ def ema(series, span):
 def rsi(series, period=14):
     delta = series.diff()
     up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
+    down = -1*delta.clip(upper=0)
     ma_up = up.ewm(alpha=1/period, adjust=False).mean()
     ma_down = down.ewm(alpha=1/period, adjust=False).mean()
     rs = np.where(ma_down>1e-9, ma_up/ma_down, 100)
-    return 100 - (100 / (1 + rs))
+    return 100-(100/(1+rs))
 
 def calculate_signal(close_series):
-    if len(close_series) < 50:
-        return None
-    ema8 = ema(close_series, 8).iloc[-1]
-    ema21 = ema(close_series, 21).iloc[-1]
+    if len(close_series)<50: return None
+    ema8 = ema(close_series,8).iloc[-1]
+    ema21 = ema(close_series,21).iloc[-1]
     rsi_val = rsi(close_series).iloc[-1]
-    score = 0
-    if ema8 > ema21: score += 30
-    else: score -= 30
-    if rsi_val < 30: score += 25
-    elif rsi_val > 70: score -= 25
-    direction = "BUY" if score>0 else "WAIT"
-    confidence = min(95,max(5,50+abs(score)*0.4))
-    return {"direction": direction, "confidence": confidence, "rsi": rsi_val, "score": score}
+    score=0
+    if ema8>ema21: score+=30
+    else: score-=30
+    if rsi_val<30: score+=25
+    elif rsi_val>70: score-=25
+    direction="BUY" if score>0 else "WAIT"
+    confidence=min(95,max(5,50+abs(score)*0.4))
+    return {"direction":direction,"confidence":confidence,"rsi":rsi_val,"score":score}
 
 # -----------------------
 # Gestión de posiciones
@@ -89,6 +87,7 @@ class TradeStateManager:
     def __init__(self):
         self.state = self.load_state()
         self.lock = threading.Lock()
+
     def load_state(self):
         if os.path.exists(STATE_FILE):
             try:
@@ -97,10 +96,12 @@ class TradeStateManager:
             except:
                 pass
         return {"positions":{},"last_training":None}
+
     def save_state(self):
         with self.lock:
             with open(STATE_FILE,"w") as f:
                 json.dump(self.state,f,indent=2)
+
     def add_position(self,symbol,qty,entry_price):
         with self.lock:
             if symbol not in self.state["positions"]:
@@ -116,6 +117,7 @@ class TradeStateManager:
             })
             self.save_state()
             return pos_id
+
     def update_position(self,symbol,current_price):
         with self.lock:
             if symbol in self.state["positions"]:
@@ -123,6 +125,7 @@ class TradeStateManager:
                     if pos["status"]=="open":
                         pos["highest_price"]=max(pos["highest_price"],current_price)
                 self.save_state()
+
     def get_open_positions(self,symbol=None):
         with self.lock:
             if symbol:
@@ -132,15 +135,16 @@ class TradeStateManager:
                 for sym,positions in self.state["positions"].items():
                     all_positions.extend([p for p in positions if p["status"]=="open"])
                 return all_positions
+
     def should_take_profit(self,position,current_price,take_profit_pct=0.5):
-        entry=position["entry_price"]
-        highest=position["highest_price"]
-        # Nunca vende en pérdida, solo vende en ganancia
-        if current_price>=entry*(1+take_profit_pct/100):
+        entry = position["entry_price"]
+        highest = position["highest_price"]
+        if current_price >= entry*(1+take_profit_pct/100):
             return True
-        if current_price>=entry*1.001 and current_price<highest*0.995:
+        if current_price >= entry*1.001 and current_price < highest*0.995:
             return True
         return False
+
     def close_position(self,symbol,position_id):
         with self.lock:
             if symbol in self.state["positions"]:
@@ -151,57 +155,62 @@ class TradeStateManager:
                         self.save_state()
                         return True
             return False
+
     def get_total_exposure(self,symbol):
         with self.lock:
-            positions=self.get_open_positions(symbol)
+            positions = self.get_open_positions(symbol)
             return sum(p["qty"]*p["entry_price"] for p in positions)
 
 # -----------------------
-# Clase Trader
+# Trader
 # -----------------------
 class AlpacaTrader:
     def __init__(self,api_key,api_secret,base_url):
         self.api=tradeapi.REST(api_key,api_secret,base_url,api_version='v2')
         self.state_manager=TradeStateManager()
-        # Solo activos 24/7 (crypto)
+        # Criptos 24/7
         self.symbols=["BTCUSD","ETHUSD","LTCUSD","BCHUSD","DOGEUSD"]
-        self.is_streaming=False
+        self.running=False
+
     def get_historical_data(self,symbol,limit=100):
         try:
             bars=self.api.get_bars(symbol,"1Min",limit=limit).df
+            # Manejar MultiIndex
             if isinstance(bars.columns,pd.MultiIndex):
-                bars=bars[symbol]
+                bars = bars[symbol]
             return bars
-        except Exception as e:
-            st.warning(f"Error obteniendo {symbol}: {e}")
+        except:
             return None
+
     def execute_buy(self,symbol,current_price):
         try:
             account=self.api.get_account()
             buying_power=float(account.buying_power)
             max_risk=min(1000,buying_power*0.05)
             qty=max(1,int(max_risk/current_price))
-            current_exposure=self.state_manager.get_total_exposure(symbol)
-            if current_exposure>buying_power*0.2:
+            if self.state_manager.get_total_exposure(symbol)>buying_power*0.2:
                 return
             self.api.submit_order(symbol=symbol,qty=qty,side='buy',type='market',time_in_force='day')
             self.state_manager.add_position(symbol,qty,current_price)
-        except Exception as e:
-            st.warning(f"Error comprando {symbol}: {e}")
+        except:
+            pass
+
     def execute_sell(self,symbol,position_id,qty,current_price):
         try:
             self.api.submit_order(symbol=symbol,qty=qty,side='sell',type='market',time_in_force='day')
             self.state_manager.close_position(symbol,position_id)
-        except Exception as e:
-            st.warning(f"Error vendiendo {symbol}: {e}")
+        except:
+            pass
+
     def check_positions(self,symbol,current_price):
         open_positions=self.state_manager.get_open_positions(symbol)
         for pos in open_positions:
             if self.state_manager.should_take_profit(pos,current_price):
                 self.execute_sell(symbol,pos["id"],pos["qty"],current_price)
+
     def start_bot(self):
         self.running=True
-        def bot_loop():
+        def loop():
             while self.running:
                 for symbol in self.symbols:
                     df=self.get_historical_data(symbol,50)
@@ -212,8 +221,9 @@ class AlpacaTrader:
                             self.execute_buy(symbol,current_price)
                         self.check_positions(symbol,current_price)
                 time.sleep(10)
-        self.thread=threading.Thread(target=bot_loop,daemon=True)
+        self.thread=threading.Thread(target=loop,daemon=True)
         self.thread.start()
+
     def stop_bot(self):
         self.running=False
         if hasattr(self,"thread") and self.thread.is_alive():
@@ -223,17 +233,17 @@ class AlpacaTrader:
 # Interfaz Streamlit
 # -----------------------
 def main():
-    creds=setup_credentials()
-    trader=AlpacaTrader(creds["ALPACA_API_KEY"],creds["ALPACA_API_SECRET"],creds["ALPACA_BASE_URL"])
+    creds = setup_credentials()
+    trader = AlpacaTrader(creds["ALPACA_API_KEY"],creds["ALPACA_API_SECRET"],creds["ALPACA_BASE_URL"])
 
-    st.title("🤖 QuickTrend Trader Pro - Demo/Real")
+    st.title("🤖 QuickTrend Trader Pro - 24/7 Cripto")
     col1,col2=st.columns(2)
-    if st.button("🚦 Iniciar Bot"):
+    if col1.button("🚦 Iniciar Bot"):
         trader.start_bot()
-        st.success("Bot iniciado")
-    if st.button("🛑 Detener Bot"):
+        st.success("Bot iniciado!")
+    if col2.button("🛑 Detener Bot"):
         trader.stop_bot()
-        st.warning("Bot detenido")
+        st.warning("Bot detenido!")
 
     st.subheader("📊 Gráficos y Posiciones")
     for symbol in trader.symbols:
